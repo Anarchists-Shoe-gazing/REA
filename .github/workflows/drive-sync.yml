@@ -1,0 +1,82 @@
+name: Sync Markdown to Google Drive
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '**/*.md'
+      - '*.md'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Preview without transferring any files'
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: drive-markdown-sync-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  upload:
+    # Safe off-switch: missing variable means no job starts.
+    if: ${{ vars.GDRIVE_SYNC_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      TARGET_REPO: ${{ github.event.repository.name }}
+      RCLONE_CONFIG_GDRIVE_TYPE: drive
+      RCLONE_CONFIG_GDRIVE_SCOPE: drive
+      RCLONE_CONFIG_GDRIVE_ROOT_FOLDER_ID: "1ofGnXYdmYA2KyfVjDZIXmpCqotDzcasV"
+      RCLONE_CONFIG_GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
+      RCLONE_CONFIG_GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
+      RCLONE_CONFIG_GDRIVE_TOKEN: ${{ secrets.GDRIVE_OAUTH_TOKEN }}
+
+    steps:
+      - name: Check out latest main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+          submodules: false
+          lfs: false
+
+      - name: Verify credential presence
+        shell: bash
+        run: |
+          set -euo pipefail
+          for var in RCLONE_CONFIG_GDRIVE_CLIENT_ID RCLONE_CONFIG_GDRIVE_CLIENT_SECRET RCLONE_CONFIG_GDRIVE_TOKEN; do
+            if [[ -z "${!var:-}" ]]; then
+              echo "::error::Missing GitHub Secret for ${var}"
+              exit 1
+            fi
+          done
+          [[ "$TARGET_REPO" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "::error::Unsafe repo name"; exit 1; }
+
+      - name: Install rclone
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rclone
+          rclone version | head -n 1
+
+      - name: Upload tracked Markdown files, preserving Drive deletions
+        shell: bash
+        env:
+          RUN_DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          # actions/checkout only checks out tracked files, no submodule or LFS fetch.
+          # Keep source tree structure. All repositories get their own Drive folder.
+          args=(copy "." "gdrive:${TARGET_REPO}" --include '*.md' --checksum
+                --transfers 2 --checkers 4 --tpslimit 5 --stats-one-line -v)
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" && "$RUN_DRY_RUN" == "true" ]]; then
+            args+=(--dry-run)
+          fi
+          rclone "${args[@]}"
+          echo "Markdown copy request processed for ${GITHUB_REPOSITORY}" >> "$GITHUB_STEP_SUMMARY"
